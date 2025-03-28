@@ -1,6 +1,6 @@
 // content.js
 function getMainText() {
-  const paragraphs = document.querySelectorAll("p");
+  const paragraphs = document.querySelectorAll("p, h1, h2, h3, h4, h5, h6, li, blockquote, div:not([class]):not([id])");
   return Array.from(paragraphs).map(p => p.innerText).join(" \n");
 }
 
