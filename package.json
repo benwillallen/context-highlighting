@@ -1,0 +1,23 @@
+{
+  "name": "context-highlighter",
+  "version": "1.0.0",
+  "description": "Browser extension that highlights important topics and entities on a webpage",
+  "type": "module",
+  "scripts": {
+    "build": "webpack",
+    "build:chrome": "cross-env NODE_ENV=chromium webpack",
+    "build:firefox": "cross-env NODE_ENV=firefox webpack",
+    "build:all": "npm run build:chrome && npm run build:firefox"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.10.0",
+    "@xenova/transformers": "^2.5.0"
+  },
+  "devDependencies": {
+    "copy-webpack-plugin": "^11.0.0",
+    "cross-env": "^7.0.3",
+    "html-webpack-plugin": "^5.5.0",
+    "webpack": "^5.76.0",
+    "webpack-cli": "^5.0.1"
+  }
+}

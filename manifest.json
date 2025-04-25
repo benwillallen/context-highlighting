@@ -1,19 +1,45 @@
 {
-    "manifest_version": 3,
-    "name": "Context Highlighter",
-    "version": "1.0",
-    "description": "Highlights the most important sentences on a webpage.",
-    "permissions": ["activeTab", "scripting"],
-    "host_permissions": ["<all_urls>"] ,
-    "background": {
-      "service_worker": "background.js"
-    },
-    "action": {
-      "default_popup": "popup.html",
-      "default_icon": {
-        "16": "./images/logo16.png",
-        "48": "./images/logo48.png",
-        "128": "./images/logo128.png"
-      }
+  "manifest_version": 3,
+  "name": "Context Highlighter",
+  "version": "1.0",
+  "description": "Highlights important topics and entities on webpages using semantic analysis",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "offscreen",
+    "storage"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/logo16.png",
+      "48": "images/logo48.png",
+      "128": "images/logo128.png"
     }
+  },
+  "icons": {
+    "16": "images/logo16.png", 
+    "48": "images/logo48.png",
+    "128": "images/logo128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["worker.js", "backend/semantic_mapping.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; worker-src 'self'; style-src 'self'; connect-src *; media-src *; script-src 'self' 'wasm-unsafe-eval'"
   }
+}
