@@ -1,5 +1,3 @@
-// offscreen.js - Handles processing in Chrome's offscreen document
-// This is specifically for Chrome extensions using Manifest V3
 console.log('Offscreen script loaded');
 
 // Import TensorFlow.js

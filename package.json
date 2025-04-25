@@ -10,6 +10,7 @@
     "build:all": "npm run build:chrome && npm run build:firefox"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.5.0",
     "@tensorflow/tfjs": "^4.10.0",
     "@xenova/transformers": "^2.5.0"
   },

@@ -1,4 +1,3 @@
-// background.js - Main controller for the browser extension
 console.log('Background script starting');
 
 // Global state management
@@ -246,27 +245,15 @@ function processTopicExtraction(message, sender, browserAPI) {
         options: message.options || {}
       });
       
-      // Send to both the tab (if from a tab) and the popup
-      if (tabId) {
-        console.log('Sending topics to tab:', tabId);
-        browserAPI.tabs.sendMessage(tabId, {
-          action: 'topics-extracted',
-          topics: result.topics || result, // Handle both new and old format
-          requestId: requestId,
-          canIterate: result.canIterate !== false,
-          iteration: result.iteration || 0
-        }).catch(err => console.error('Error sending topics to tab:', err));
-      }
-      
-      // Always send to popup via runtime messaging (no tab needed)
-      console.log('Sending topics to popup via runtime');
-      browserAPI.runtime.sendMessage({
-        action: 'topics-extracted',
-        topics: result.topics || result, // Handle both new and old format
-        requestId: requestId,
-        canIterate: result.canIterate !== false,
-        iteration: result.iteration || 0
-      }).catch(err => console.error('Error sending topics to popup:', err));
+      // Send to both the tab and any other listeners
+      return sendTopicsToListeners(
+        result.topics || result,
+        requestId,
+        tabId,
+        result.iteration || 0,
+        result.canIterate !== false,
+        browserAPI
+      );
     })
     .catch(error => {
       console.error(`Topic extraction error for request ${requestId}:`, error);
@@ -276,7 +263,6 @@ function processTopicExtraction(message, sender, browserAPI) {
       // Clean up the promise from our tracking maps
       state.activeExtractionPromises.delete(requestId);
       state.processingRequests.delete(requestKey);
-      // Note: We keep the iterationStates entry for potential future iterations
     });
 }
 
@@ -383,12 +369,56 @@ function notifyError(tabId, errorMessage, browserAPI) {
     }).catch(err => console.error('Error sending error to tab:', err));
   }
   
-  // Always send to popup via runtime messaging (no tab needed)
+  // Try to send to popup but don't throw if popup is closed
   console.log('Sending error to popup via runtime');
   browserAPI.runtime.sendMessage({
     action: 'error',
     error: errorMessage
-  }).catch(err => console.error('Error sending error to popup:', err));
+  }).catch(err => {
+    // Check if this is a "message channel closed" error, which is expected if popup closed
+    if (err.message.includes('message channel closed')) {
+      console.log('Popup appears to be closed, cannot send error notification');
+    } else {
+      console.error('Error sending error to popup:', err);
+    }
+  });
+}
+
+// Process topics and send to all listening contexts
+function sendTopicsToListeners(topics, requestId, tabId, iteration, canIterate, browserAPI) {
+  const payload = {
+    action: 'topics-extracted',
+    topics: topics,
+    requestId: requestId,
+    canIterate: canIterate !== false,
+    iteration: iteration || 0
+  };
+  
+  // Promise array to track all sends
+  const sendPromises = [];
+  
+  // Send to tab if we have one
+  if (tabId) {
+    sendPromises.push(
+      browserAPI.tabs.sendMessage(tabId, payload)
+        .catch(err => console.log('Tab may be closed or not listening:', err))
+    );
+  }
+  
+  // Send to any other listeners (like popup)
+  sendPromises.push(
+    browserAPI.runtime.sendMessage(payload)
+      .catch(err => {
+        if (err.message.includes('message channel closed')) {
+          console.log('Some listeners (like popup) may be closed, message not delivered');
+        } else {
+          console.error('Error sending topics to runtime listeners:', err);
+        }
+      })
+  );
+  
+  // Return a promise that resolves when all sends complete or fail
+  return Promise.allSettled(sendPromises);
 }
 
 // Handle messages from content scripts
@@ -676,7 +706,7 @@ async function extractTopics(text, topN = 5, options = {}, tabId, requestId = nu
       setTimeout(() => {
         chrome.runtime.onMessage.removeListener(messageListener);
         reject(new Error("Topic extraction timed out after 2 minutes"));
-      }, 120000);
+      }, 360000);
     });
   } else {
     const error = new Error("No topic extraction method available");

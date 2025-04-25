@@ -1,4 +1,3 @@
-// Web worker for handling semantic mapping and topic extraction
 console.log('Worker script starting');
 
 // Import TensorFlow.js

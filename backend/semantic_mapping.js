@@ -1,4 +1,3 @@
-// Browser-compatible semantic mapping implementation
 import { pipeline, env } from '@xenova/transformers';
 import * as tf from '@tensorflow/tfjs';
 
@@ -34,7 +33,9 @@ export class TopicExtractor {
             console.log('TopicExtractor: Loading feature extraction model');
             console.time('feature-extraction-model-load');
             this.extractor = await pipeline('feature-extraction', 'Xenova/all-mpnet-base-v2', {
+                // dtype: 'q8', // For @huggingface not @xenova
                 quantized: true,
+                device: 'webGPU',
             });
             console.timeEnd('feature-extraction-model-load');
             console.log('TopicExtractor: Feature extraction model loaded successfully');
@@ -42,6 +43,7 @@ export class TopicExtractor {
             console.log('TopicExtractor: Loading NER model');
             console.time('ner-model-load');
             this.entities = await pipeline('ner', 'Xenova/distilbert-base-multilingual-cased-ner-hrl', {
+                // dtype: 'q8', // For @huggingface not @xenova
                 quantized: true,
             });
             console.timeEnd('ner-model-load');
@@ -63,62 +65,71 @@ export class TopicExtractor {
         }
 
         console.time('extract-topics-total');
-        
+
         console.log('TopicExtractor: Chunking text');
         console.time('chunking');
         const chunks = this.chunkTextWithOverlap(text, 512, 50);
         console.timeEnd('chunking');
         console.log(`TopicExtractor: Text chunked into ${chunks.length} parts`);
-        
+
         console.log('TopicExtractor: Processing chunks');
         console.time('process-chunks');
         const processedChunks = await this.processChunks(chunks);
         console.timeEnd('process-chunks');
         console.log(`TopicExtractor: Processed ${processedChunks.length} chunks`);
-        
+
         console.log('TopicExtractor: Aggregating entities');
         console.time('aggregate-entities');
-        const { entityMap, chunkTensors } = await this.aggregateEntities(processedChunks);
+        // aggregateEntities now returns validChunkTensors
+        const { entityMap, chunkTensors: validChunkTensors } = await this.aggregateEntities(processedChunks);
         console.timeEnd('aggregate-entities');
-        console.log(`TopicExtractor: Found ${entityMap.size} unique entities`);
-        
+        console.log(`TopicExtractor: Found ${entityMap.size} unique entities after aggregation`);
+
         console.log('TopicExtractor: Computing document embedding');
         console.time('doc-embedding');
-        const docEmbedding = this.averageEmbeddings(chunkTensors);
+        // Use only validChunkTensors for document embedding
+        const docEmbedding = this.averageEmbeddings(validChunkTensors);
         console.timeEnd('doc-embedding');
-        
+
         console.log('TopicExtractor: Scoring and sorting entities');
         console.time('scoring');
         const results = this.scoreAndSortEntities(entityMap, docEmbedding, topN, options);
         console.timeEnd('scoring');
         console.log(`TopicExtractor: Selected top ${results.length} topics`);
-        
+
         console.log('TopicExtractor: Cleaning up tensors');
-        chunkTensors.forEach(t => t.dispose());
-        docEmbedding.dispose();
-        entityMap.forEach(agg => agg.embeddingSum.dispose());
-        
+        // Dispose valid chunk tensors that were collected
+        validChunkTensors.forEach(t => {
+            if (t && !t.isDisposed) t.dispose();
+        });
+        // Dispose document embedding
+        if (docEmbedding && !docEmbedding.isDisposed) docEmbedding.dispose();
+        // Dispose final entityMap embedding sums
+        entityMap.forEach(agg => {
+            if (agg.embeddingSum && !agg.embeddingSum.isDisposed) {
+                agg.embeddingSum.dispose();
+            }
+        });
+
         console.timeEnd('extract-topics-total');
         console.log('TopicExtractor: Topic extraction complete', results);
         return results;
     }
 
     async processChunks(chunks) {
-        console.log(`TopicExtractor: Processing ${chunks.length} chunks`);
-        return Promise.all(chunks.map(async (chunk, index) => {
-            console.log(`TopicExtractor: Processing chunk ${index+1}/${chunks.length}, length=${chunk.text.length}`);
+        console.log(`TopicExtractor: Processing ${chunks.length} chunks selectively`);
+        const results = [];
+        for (let index = 0; index < chunks.length; index++) {
+            const chunk = chunks[index];
+            console.log(`TopicExtractor: Processing chunk ${index + 1}/${chunks.length}, length=${chunk.text.length}`);
             try {
                 console.time(`chunk-${index}-processing`);
-                
-                console.time(`chunk-${index}-embedding`);
-                const embeddingTensor = await this.extractor(chunk.text, { pooling: 'mean' });
-                console.timeEnd(`chunk-${index}-embedding`);
-                
+
                 console.time(`chunk-${index}-ner`);
                 const nerResults = await this.entities(chunk.text);
                 console.timeEnd(`chunk-${index}-ner`);
-                console.log(`TopicExtractor: Chunk ${index+1} - Found ${nerResults.length} entity tokens`);
-                
+                console.log(`TopicExtractor: Chunk ${index + 1} - Found ${nerResults.length} entity tokens`);
+
                 let minStart = 0;
                 const tokenEntities = nerResults.map(ent => {
                     minStart = chunk.text.indexOf(ent.word, minStart);
@@ -130,27 +141,45 @@ export class TopicExtractor {
                             minStart + ent.word.length
                     };
                 });
-                
+
                 console.time(`chunk-${index}-merge-entities`);
                 const mergedEntities = this.mergeEntityTokens(tokenEntities)
                     .map(entity => ({
-                    ...entity,
-                    start: chunk.offset + entity.start,
-                    end: chunk.offset + entity.end
-                }));
+                        ...entity,
+                        start: chunk.offset + entity.start,
+                        end: chunk.offset + entity.end
+                    }));
                 console.timeEnd(`chunk-${index}-merge-entities`);
-                console.log(`TopicExtractor: Chunk ${index+1} - Merged into ${mergedEntities.length} entities`);
-                
+                console.log(`TopicExtractor: Chunk ${index + 1} - Merged into ${mergedEntities.length} entities`);
+
+                let embeddingTensor = null;
+                if (mergedEntities.length > 0) {
+                    // Only calculate embedding if entities were found
+                    console.time(`chunk-${index}-embedding`);
+                    const rawEmbedding = await this.extractor(chunk.text, { pooling: 'mean' });
+                    embeddingTensor = this.convertTransformersTensor(rawEmbedding);
+                    console.timeEnd(`chunk-${index}-embedding`);
+                    console.log(`TopicExtractor: Chunk ${index + 1} - Embedding calculated.`);
+                } else {
+                    console.log(`TopicExtractor: Chunk ${index + 1} - Skipping embedding (no entities found).`);
+                }
+
                 console.timeEnd(`chunk-${index}-processing`);
-                return {
-                    embeddings: this.convertTransformersTensor(embeddingTensor),
+                results.push({
+                    embeddings: embeddingTensor, // Will be null if skipped
                     entities: mergedEntities
-                };
+                });
+
             } catch (error) {
                 console.error(`TopicExtractor: Error processing chunk ${index}:`, error);
-                throw error;
+                // Decide how to handle errors: skip chunk, throw, return partial results?
+                // For now, let's push a result indicating failure for this chunk
+                results.push({ embeddings: null, entities: [], error: error.message });
+                // Optionally re-throw if one chunk failure should stop the whole process
+                // throw error;
             }
-        }));
+        }
+        return results;
     }
 
     convertTransformersTensor(tensor) {
@@ -168,7 +197,7 @@ export class TopicExtractor {
             }
         } catch (error) {
             console.error('TopicExtractor: Error converting tensor:', error);
-            throw new Error('Failed to convert tensor: ' + error.message);
+            throw new Error(`Failed to convert tensor: ${error.message}`);
         }
     }
 
@@ -182,29 +211,71 @@ export class TopicExtractor {
     async aggregateEntities(chunks) {
         console.log('TopicExtractor: Aggregating entities from chunks');
         const entityMap = new Map();
-        const chunkTensors = [];
-        
-        chunks.forEach(chunk => {
-            chunkTensors.push(chunk.embeddings);
+        const chunkTensors = []; // Only store non-null tensors
+        let firstEmbeddingShape = null; // Store the shape from the first valid embedding
+
+        chunks.forEach((chunk, chunkIndex) => {
+            // Add embedding to list only if it exists
+            if (chunk.embeddings && !chunk.embeddings.isDisposed) {
+                chunkTensors.push(chunk.embeddings);
+                if (!firstEmbeddingShape) {
+                    firstEmbeddingShape = chunk.embeddings.shape;
+                }
+            } else if (chunk.embeddings && chunk.embeddings.isDisposed) {
+                 console.warn(`Chunk ${chunkIndex} embedding was already disposed before aggregation.`);
+            }
+
             chunk.entities.forEach(entity => {
                 const key = entity.text.toLowerCase();
-                const existing = entityMap.get(key) ?? {
-                    indices: [],
-                    types: new Set(),
-                    embeddingSum: tf.zeros(chunk.embeddings.shape),
-                    count: 0,
-                    mentions: []
-                };
-                
-                const newSum = tf.tidy(() => {
-                    return existing.embeddingSum.add(chunk.embeddings);
-                });
-                
-                if (existing.embeddingSum) {
-                    existing.embeddingSum.dispose();
+                let existing = entityMap.get(key);
+
+                // Initialize if it's the first time seeing this entity
+                if (!existing) {
+                    // Determine the correct shape for the zero tensor
+                    // Use the shape from the current chunk if available,
+                    // otherwise use the first shape we found, or fallback later
+                    const initialShape = chunk.embeddings ? chunk.embeddings.shape : firstEmbeddingShape;
+                    existing = {
+                        indices: [],
+                        types: new Set(),
+                        // Initialize embeddingSum only if we know the shape
+                        embeddingSum: initialShape ? tf.zeros(initialShape) : null,
+                        count: 0,
+                        mentions: [],
+                        // Track how many embeddings contributed to the sum
+                        embeddingCount: 0
+                    };
                 }
-                
-                existing.embeddingSum = newSum;
+
+                // If embeddingSum is null (because no previous chunk had an embedding),
+                // try to initialize it now.
+                if (!existing.embeddingSum && chunk.embeddings && !chunk.embeddings.isDisposed) {
+                    existing.embeddingSum = tf.zeros(chunk.embeddings.shape);
+                }
+
+                // Add the current chunk's embedding only if it exists and embeddingSum is initialized
+                if (chunk.embeddings && !chunk.embeddings.isDisposed && existing.embeddingSum) {
+                    const currentSum = existing.embeddingSum;
+                    const newSum = tf.tidy(() => {
+                        // Ensure shapes match before adding - might happen if models change unexpectedly
+                        if (JSON.stringify(currentSum.shape) !== JSON.stringify(chunk.embeddings.shape)) {
+                            console.warn(`Shape mismatch for entity "${key}". Expected ${JSON.stringify(currentSum.shape)}, got ${JSON.stringify(chunk.embeddings.shape)}. Skipping add.`);
+                            return currentSum.clone(); // Return the old sum
+                        }
+                        return currentSum.add(chunk.embeddings);
+                    });
+
+                    // Dispose the old sum tensor and update
+                    currentSum.dispose();
+                    existing.embeddingSum = newSum;
+                    existing.embeddingCount++; // Increment count only when embedding is added
+                } else if (chunk.embeddings && chunk.embeddings.isDisposed) {
+                     console.warn(`Skipping disposed embedding for entity "${key}" from chunk ${chunkIndex}`);
+                } else if (!existing.embeddingSum) {
+                     console.warn(`Cannot add embedding for entity "${key}" yet, embeddingSum not initialized.`);
+                }
+
+
                 existing.indices.push(entity.start);
                 this.getSubcategoriesFromEntity(entity).forEach(type => existing.types.add(type));
                 existing.mentions.push({
@@ -213,30 +284,49 @@ export class TopicExtractor {
                     end: entity.end,
                     type: entity.type
                 });
-                existing.count++;
+                existing.count++; // Increment mention count regardless of embedding
                 entityMap.set(key, existing);
             });
         });
         console.log(`TopicExtractor: Found ${entityMap.size} unique entities before grouping`);
-        
+
+        // Handle entities where embeddingSum might still be null (if they only appeared in chunks without embeddings)
+        // Option 1: Remove them? Option 2: Keep them but they won't be scored by similarity?
+        // Let's keep them for now, scoreAndSortEntities will handle null embeddings.
+        entityMap.forEach((agg, key) => {
+            if (!agg.embeddingSum) {
+                console.warn(`Entity "${key}" has no valid embeddingSum after aggregation.`);
+                // Optionally create a zero tensor now if a shape is known
+                if (firstEmbeddingShape) {
+                    agg.embeddingSum = tf.zeros(firstEmbeddingShape);
+                    agg.embeddingCount = 0; // Ensure embeddingCount is 0
+                }
+            }
+        });
+
+
         console.log('TopicExtractor: Grouping related entities');
         console.time('group-entities');
+        // Pass the potentially modified entityMap to grouping
         const { groups, ungroupedEntities } = await this.groupRelatedEntities(entityMap);
         console.timeEnd('group-entities');
         console.log(`TopicExtractor: Created ${groups.size} groups, ${ungroupedEntities.size} remain ungrouped`);
-        
+
         const finalEntityMap = new Map();
-        
+
         groups.forEach(group => {
             finalEntityMap.set(group.primaryForm, group.combinedAggregation);
         });
-        
+
         ungroupedEntities.forEach((agg, text) => {
             finalEntityMap.set(text, agg);
         });
-        
+
         console.log(`TopicExtractor: Final entity map contains ${finalEntityMap.size} entries`);
-        return { entityMap: finalEntityMap, chunkTensors };
+        // Ensure chunkTensors contains only valid, non-disposed tensors before returning
+        const validChunkTensors = chunkTensors.filter(t => t && !t.isDisposed);
+        console.log(`TopicExtractor: Returning ${validChunkTensors.length} valid chunk tensors.`);
+        return { entityMap: finalEntityMap, chunkTensors: validChunkTensors };
     }
 
     averageEmbeddings(tensors) {
@@ -254,24 +344,35 @@ export class TopicExtractor {
         return tf.tidy(() => {
             return Array.from(entityMap.entries())
                 .map(([text, data]) => {
-                    const avgEmbedding = data.embeddingSum.div(data.count);
-                    const similarity = this.cosineSimilarity(avgEmbedding, docEmbedding, options?.useL2Norm);
+                    let similarity = 0; // Default similarity if no embedding exists
+                    // Check if we have a valid embeddingSum and count to calculate average
+                    if (data.embeddingSum && !data.embeddingSum.isDisposed && data.embeddingCount > 0) {
+                        const avgEmbedding = data.embeddingSum.div(data.embeddingCount); // Use embeddingCount
+                        similarity = this.cosineSimilarity(avgEmbedding, docEmbedding, options?.useL2Norm);
+                        // avgEmbedding is temporary and managed by tf.tidy
+                    } else if (data.embeddingSum && data.embeddingSum.isDisposed) {
+                         console.warn(`Entity "${text}" embeddingSum was disposed before scoring.`);
+                    } else {
+                         console.warn(`Entity "${text}" has no valid embedding or embeddingCount is zero. Assigning similarity 0.`);
+                    }
+
+
                     const entityGroups = new Map();
-                    
+
                     data.mentions.forEach(mention => {
                         const mentions = entityGroups.get(mention.type) || [];
                         mentions.push(mention);
                         entityGroups.set(mention.type, mentions);
                     });
-                    
+
                     return {
                         topic: text,
                         indices: [...new Set(data.indices)].sort((a, b) => a - b),
                         subcategories: Array.from(data.types).sort(),
-                        relevanceScore: similarity,
+                        relevanceScore: similarity, // Use calculated or default similarity
                         entityDetails: Array.from(entityGroups.entries())
                             .map(([type, mentions]) => ({
-                                type,
+                                type: type,
                                 mentions: mentions.sort((a, b) => a.start - b.start)
                             }))
                     };
@@ -283,17 +384,47 @@ export class TopicExtractor {
     }
 
     cosineSimilarity(a, b, useL2Norm = false) {
+        // Ensure input tensors are valid before proceeding
+        if (!a || a.isDisposed || !b || b.isDisposed) {
+            console.warn('Cosine Similarity: Input tensor disposed.');
+            return 0;
+        }
+
         return tf.tidy(() => {
             const aFlat = a.flatten();
             const bFlat = b.flatten();
             const dotProduct = aFlat.dot(bFlat);
-            
-            if (useL2Norm) {
-                return dotProduct.dataSync()[0];
-            } else {
-                const normA = aFlat.norm();
-                const normB = bFlat.norm();
-                return dotProduct.div(normA.mul(normB)).dataSync()[0] || 0;
+
+            if (useL2Norm) { // If true, calculate dot product ONLY
+                const dotResult = dotProduct.dataSync();
+                return dotResult.length > 0 ? dotResult[0] : 0;
+            } else { // Default: Calculate normalized cosine similarity
+                const normA = aFlat.norm(); // Defined here
+                const normB = bFlat.norm(); // Defined here
+
+                // Check if norms are valid before multiplication
+                if (normA.isDisposed || normB.isDisposed) {
+                    console.warn('Cosine Similarity: Norm tensor disposed during calculation.');
+                    return 0;
+                }
+
+                const normProduct = normA.mul(normB);
+
+                // Prevent division by zero
+                const normProductVal = normProduct.dataSync()[0];
+                if (normProductVal === 0) {
+                    return 0;
+                }
+
+                // Check if dotProduct is valid before division
+                if (dotProduct.isDisposed) {
+                     console.warn('Cosine Similarity: Dot product tensor disposed before division.');
+                     return 0;
+                }
+
+                const similarity = dotProduct.div(normProduct);
+                const similarityResult = similarity.dataSync();
+                return similarityResult.length > 0 ? similarityResult[0] : 0;
             }
         });
     }
@@ -542,7 +673,7 @@ export class TopicExtractor {
         } catch (error) {
             console.error(`TopicExtractor: Error getting embedding for "${text}":`, error);
             // Return a zero tensor as fallback
-            return tf.zeros([768]);
+            return tf.zeros([768]); // Assuming 768 is the embedding dimension
         }
     }
 
@@ -557,10 +688,12 @@ export class TopicExtractor {
         const norm1 = this.normalizeEntityText(entity1);
         const norm2 = this.normalizeEntityText(entity2);
         
-        if (norm1 === norm2)
+        if (norm1 === norm2) {
             return true;
-        if (norm1.includes(norm2) || norm2.includes(norm1))
+        }
+        if (norm1.includes(norm2) || norm2.includes(norm1)) {
             return true;
+        }
         
         const similarity = this.cosineSimilarity(embed1, embed2);
         return similarity > 0.9;
@@ -575,73 +708,163 @@ export class TopicExtractor {
         const groups = new Map();
         const ungroupedEntities = new Map();
         const processedEntities = new Set();
-        const entityEmbeddings = new Map();
-        
-        console.log('TopicExtractor: Getting embeddings for entities');
-        await Promise.all(Array.from(entityMap.entries()).map(async ([text, _]) => {
-            entityEmbeddings.set(text, await this.getEntityEmbedding(text));
-        }));
-        console.log(`TopicExtractor: Got embeddings for ${entityEmbeddings.size} entities`);
-        
+        const averageEmbeddings = new Map(); // Store calculated average embeddings
+        const tensorsToDispose = []; // Keep track of tensors to dispose manually
+
+        // Pre-calculate average embeddings for comparison - OUTSIDE tf.tidy
+        console.log(`TopicExtractor: Calculating average embeddings for ${entityMap.size} entities for grouping`);
+        entityMap.forEach((aggregation, text) => {
+            // Check if embeddingSum exists, is not disposed, and embeddingCount > 0
+            if (aggregation.embeddingSum && !aggregation.embeddingSum.isDisposed && aggregation.embeddingCount > 0) {
+                // Calculate average embedding using embeddingCount
+                const avgEmbedding = tf.tidy(() => aggregation.embeddingSum.div(aggregation.embeddingCount));
+                averageEmbeddings.set(text, avgEmbedding);
+                tensorsToDispose.push(avgEmbedding); // Track for later disposal
+            } else {
+                 // Handle cases where no valid average embedding can be calculated
+                 if (aggregation.embeddingSum && aggregation.embeddingSum.isDisposed) {
+                     console.warn(`Cannot calculate average embedding for grouping "${text}", embeddingSum disposed.`);
+                 } else if (!aggregation.embeddingSum) {
+                     console.warn(`Cannot calculate average embedding for grouping "${text}", embeddingSum missing.`);
+                 } else { // embeddingCount is 0
+                     console.warn(`Cannot calculate average embedding for grouping "${text}", embeddingCount is 0.`);
+                 }
+                 averageEmbeddings.set(text, null); // Mark as null if unusable
+            }
+        });
+        console.log(`TopicExtractor: Calculated average embeddings for ${averageEmbeddings.size} potential entities for grouping`);
+
         let groupCount = 0;
         for (const [entityText, aggregation] of entityMap.entries()) {
             if (processedEntities.has(entityText))
                 continue;
-            
+
             const relatedEntities = new Set([entityText]);
-            const relatedAggregations = [aggregation];
-            
+            const relatedAggregations = [aggregation]; // Store the full aggregation data
+
             for (const [otherText, otherAgg] of entityMap.entries()) {
                 if (otherText === entityText || processedEntities.has(otherText))
                     continue;
-                
-                const embed1 = entityEmbeddings.get(entityText);
-                const embed2 = entityEmbeddings.get(otherText);
-                
+
+                // Use the pre-calculated average embeddings
+                const embed1 = averageEmbeddings.get(entityText);
+                const embed2 = averageEmbeddings.get(otherText);
+
+                // Ensure embeddings exist (are not null) and are valid tensors before comparing
+                if (!embed1 || !embed2 || !(embed1 instanceof tf.Tensor) || !(embed2 instanceof tf.Tensor)) {
+                    continue; // Skip comparison if either embedding is invalid/missing
+                }
+
+                // Check if tensors might have been disposed unexpectedly (debugging)
+                if (embed1.isDisposed || embed2.isDisposed) {
+                    console.warn(`Tensor already disposed before comparison: ${entityText} or ${otherText}`);
+                    continue;
+                }
+
+                // Use the existing areEntitiesRelated logic which calls cosineSimilarity
                 if (this.areEntitiesRelated(entityText, otherText, embed1, embed2)) {
                     const entityTypes1 = aggregation.types;
                     const entityTypes2 = otherAgg.types;
                     const hasCompatibleTypes = Array.from(entityTypes1).some(t => entityTypes2.has(t));
-                    
+
                     if (hasCompatibleTypes) {
                         relatedEntities.add(otherText);
-                        relatedAggregations.push(otherAgg);
+                        relatedAggregations.push(otherAgg); // Add the full aggregation
                         processedEntities.add(otherText);
                     }
                 }
             }
-            
+
             if (relatedEntities.size > 1) {
                 groupCount++;
                 const primaryForm = this.findBestPrimaryForm(Array.from(relatedEntities));
+                // Pass the collected aggregations to mergeAggregations
                 const combinedAggregation = this.mergeAggregations(relatedAggregations);
-                
+
                 groups.set(primaryForm, {
                     primaryForm,
                     variations: relatedEntities,
-                    combinedAggregation
+                    combinedAggregation // Store the merged result
                 });
+                 // Dispose original embeddingSum from merged aggregations if they are not needed anymore
+                 // This is complex; safer to let final cleanup handle it.
+
             } else {
+                // Add the original aggregation to ungrouped if it wasn't grouped
                 ungroupedEntities.set(entityText, aggregation);
             }
-            
+
             processedEntities.add(entityText);
         }
-        
+
         console.log(`TopicExtractor: Created ${groupCount} entity groups`);
-        entityEmbeddings.forEach(tensor => tensor.dispose());
+
+        // Dispose the average embeddings used specifically for grouping comparisons
+        console.log(`TopicExtractor: Disposing ${tensorsToDispose.length} average embedding tensors used for grouping.`);
+        tensorsToDispose.forEach(tensor => {
+            if (tensor && !tensor.isDisposed) {
+                tensor.dispose();
+            }
+        });
+
+        // Note: The original embeddingSum tensors within the aggregations
+        // in `groups` and `ungroupedEntities` are NOT disposed here yet.
+        // They are needed for the final scoring step (or were potentially merged).
+
         return { groups, ungroupedEntities };
     }
 
     mergeAggregations(aggregations) {
+        let combinedSum = null;
+        let totalEmbeddingCount = 0;
+        let firstShape = null;
+
+        // Find the first valid embedding sum to get the shape and initialize
+        for (const agg of aggregations) {
+            if (agg.embeddingSum && !agg.embeddingSum.isDisposed && agg.embeddingCount > 0) {
+                firstShape = agg.embeddingSum.shape;
+                combinedSum = tf.zeros(firstShape); // Initialize with zeros
+                break;
+            }
+        }
+
+        // If no aggregation had a valid embedding, the combined sum remains null
+        if (combinedSum) {
+            // Keep track of the tensor across tidy scopes
+            let tempSum = combinedSum;
+            tf.tidy(() => { // Tidy scope for intermediate tensors during summation
+                aggregations.forEach(agg => {
+                    if (agg.embeddingSum && !agg.embeddingSum.isDisposed && agg.embeddingCount > 0) {
+                         // Ensure shape matches before adding
+                         if (JSON.stringify(agg.embeddingSum.shape) === JSON.stringify(firstShape)) {
+                             const currentSum = tempSum; // Use the tracked tensor
+                             tempSum = currentSum.add(agg.embeddingSum); // Update the tracked tensor
+                             currentSum.dispose(); // Dispose previous intermediate sum
+                             totalEmbeddingCount += agg.embeddingCount;
+                         } else {
+                              console.warn(`Shape mismatch during mergeAggregations. Expected ${JSON.stringify(firstShape)}, got ${JSON.stringify(agg.embeddingSum.shape)}. Skipping.`);
+                         }
+                    }
+                });
+            });
+             // Assign the final result back to combinedSum
+             combinedSum = tempSum;
+             // Ensure the final tensor is kept
+             tf.keep(combinedSum);
+
+        } else {
+             console.warn("Could not create combined embeddingSum during merge, no valid source embeddings found.");
+             // Optionally create a zero tensor if a default shape is known/acceptable
+             // combinedSum = tf.zeros(DEFAULT_SHAPE);
+        }
+
+
         return {
-            indices: [...new Set(aggregations.flatMap(agg => agg.indices))],
+            indices: [...new Set(aggregations.flatMap(agg => agg.indices))].sort((a, b) => a - b),
             types: new Set(aggregations.flatMap(agg => Array.from(agg.types))),
-            embeddingSum: tf.tidy(() => {
-                const sum = aggregations.reduce((acc, agg) => acc.add(agg.embeddingSum), tf.zeros(aggregations[0].embeddingSum.shape));
-                return sum.div(aggregations.length);
-            }),
-            count: aggregations.reduce((sum, agg) => sum + agg.count, 0),
+            embeddingSum: combinedSum, // The final calculated sum (or null)
+            count: aggregations.reduce((sum, agg) => sum + agg.count, 0), // Total mention count
+            embeddingCount: totalEmbeddingCount, // Total count of embeddings summed
             mentions: aggregations.flatMap(agg => agg.mentions)
         };
     }
@@ -677,4 +900,4 @@ export async function extractTopics(text, topN = 5, options = {}, isChromium = f
         console.timeEnd('topic-extraction-total');
         throw error;
     }
-}
+};

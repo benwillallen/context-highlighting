@@ -1,4 +1,3 @@
-// firefox-adapter.js
 // This adapter provides Firefox-specific implementation for model loading
 // since Firefox doesn't support the offscreen API
 console.log('Firefox adapter loaded');
