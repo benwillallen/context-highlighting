@@ -33,7 +33,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     const text = getMainText();
                     if (text && text.trim().length > 0) {
                         const importantSentences = computeTFIDF(text);
-                        highlightSentences(importantSentences); // Sets state.tfidfHighlighted
+                        highlightSentences(importantSentences);
                         console.log('TF-IDF highlighting done.');
                     } else {
                         console.warn("No text found for TF-IDF highlighting.");
