@@ -10,7 +10,6 @@ This is the Context Highlighting Project for ML@Rice Spring 2025. This project a
 - [Usage Instructions](#memo-usage-instructions)  
 - [Dependencies](#dependencies)
 - [Contributors](#contributors)
-- [Directory Structure](#directory-structure) 
 
 ## Setup & Installation  
 
@@ -48,16 +47,6 @@ cd glucose-ketone-forecasting
     pip install -r requirements.txt
     ```
 
-## Dependencies
-
-
-
-## Directory Structure
-
-```
-temp
-```
-
-
-## Contributors and Contacts
+## Contributors 
 #### **Team Leads:** Ben Allen, Jake Lehrman
+#### **Team Members:** 
